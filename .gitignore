@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.venv/
+.DS_Store
+.netrc
+*.netrc
+data/odds_ts/dryrun/
+data/odds_ts/*_summary.csv
+data/odds_ts/*_late_change.csv

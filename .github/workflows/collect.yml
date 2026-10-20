@@ -1,0 +1,130 @@
+name: collect
+
+on:
+  schedule:
+    # UTC。JST = UTC+9。毎日動かす (レースの無い日は一覧が空で 1 リクエストで終わる)
+    - cron: "30 23 * * *"   # morning   JST 08:30
+    - cron: "45 23 * * *"   # morning   JST 08:45 (予備)
+    - cron: "10 5 * * *"    # afternoon JST 14:10
+    - cron: "25 5 * * *"    # afternoon JST 14:25 (予備)
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "morning / afternoon / once"
+        type: choice
+        options: [morning, afternoon, once]
+        default: once
+      date:
+        description: "YYYYMMDD (空なら今日、JST)"
+        required: false
+        default: ""
+      race_id:
+        description: "once 用の race_id (12 桁)"
+        required: false
+        default: "202605040611"
+
+# 収集ジョブは午前・午後とも 1 本の列に並べる (同時に 2 つの収集器を動かさない = 並列なし)。
+# 予備 cron は本体が動いている間は待ち、本体が --until で終わった後に起動して、その時刻が --until を過ぎていればすぐ終わる。
+concurrency:
+  group: ${{ (github.event_name == 'workflow_dispatch' && inputs.mode == 'once') && format('once-{0}', github.run_id) || 'collect' }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  TZ: Asia/Tokyo
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - run: pip install -r requirements.txt
+
+      - name: decide mode
+        id: cfg
+        env:
+          EVENT: ${{ github.event_name }}
+          SCHED: ${{ github.event.schedule }}
+          IN_MODE: ${{ inputs.mode }}
+          IN_DATE: ${{ inputs.date }}
+          IN_RACE: ${{ inputs.race_id }}
+        run: |
+          if [ "$EVENT" = "schedule" ]; then
+            case "$SCHED" in
+              "30 23 * * *"|"45 23 * * *") MODE=morning ;;
+              *) MODE=afternoon ;;
+            esac
+          else
+            MODE="$IN_MODE"
+          fi
+          D="${IN_DATE:-$(date +%Y%m%d)}"
+          [[ "$D" =~ ^[0-9]{8}$ ]] || { echo "bad date: $D"; exit 1; }
+          case "$MODE" in
+            morning)   UNTIL=14:20 ;;
+            afternoon) UNTIL=17:45 ;;
+            once)      UNTIL= ; [[ "$IN_RACE" =~ ^[0-9]{12}$ ]] || { echo "bad race_id: $IN_RACE"; exit 1; } ;;
+            *) echo "bad mode: $MODE"; exit 1 ;;
+          esac
+          echo "mode=$MODE date=$D until=$UNTIL now=$(date '+%F %T %Z')"
+          { echo "mode=$MODE"; echo "date=$D"; echo "until=$UNTIL"; echo "race_id=$IN_RACE"; } >> "$GITHUB_OUTPUT"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: once (1 レースの現在値を表示するだけ、書き込みなし)
+        if: steps.cfg.outputs.mode == 'once'
+        env:
+          RID: ${{ steps.cfg.outputs.race_id }}
+        run: |
+          curl -s --max-time 10 https://ipinfo.io/json | python3 -c 'import json,sys; j=json.load(sys.stdin); print("runner:", j.get("ip"), j.get("city"), j.get("region"), j.get("country"), j.get("org"))' || echo "runner: (ipinfo 失敗)"
+          start=$(date +%s.%N)
+          python3 odds_collector.py --once "$RID" --place
+          echo "wall: $(python3 -c "print(round($(date +%s.%N) - $start, 2))") s"
+
+      - name: collect (30 分ごとに途中 push)
+        if: steps.cfg.outputs.mode != 'once'
+        timeout-minutes: 350
+        env:
+          MODE: ${{ steps.cfg.outputs.mode }}
+          D: ${{ steps.cfg.outputs.date }}
+          UNTIL: ${{ steps.cfg.outputs.until }}
+        run: |
+          W="$RUNNER_TEMP/work"
+          mkdir -p "$W/data/odds_ts"
+          cp odds_collector.py "$W/"
+          # 同じ日の既存ファイルを引き継ぐ (収集器は追記し、last_official で続きから取る)
+          cp data/odds_ts/${D}_*.csv data/odds_ts/collector.log "$W/data/odds_ts/" 2>/dev/null || true
+          python3 "$W/odds_collector.py" --date "$D" --place --until "$UNTIL" &
+          PID=$!
+          last=$SECONDS
+          while kill -0 "$PID" 2>/dev/null; do
+            sleep 30
+            if (( SECONDS - last >= 1800 )); then
+              python3 scripts/sync_odds.py "$W/data/odds_ts" "$D" "odds_ts $D $MODE (途中)" || true
+              last=$SECONDS
+            fi
+          done
+          wait "$PID"
+
+      - name: commit + push (失敗・中断でも)
+        if: always() && steps.cfg.outputs.mode != 'once' && steps.cfg.outputs.mode != ''
+        env:
+          MODE: ${{ steps.cfg.outputs.mode }}
+          D: ${{ steps.cfg.outputs.date }}
+        run: python3 scripts/sync_odds.py "$RUNNER_TEMP/work/data/odds_ts" "$D" "odds_ts $D $MODE"
+
+      - name: artifact (保険、14 日)
+        if: always() && steps.cfg.outputs.mode != 'once' && steps.cfg.outputs.mode != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: odds_ts-${{ steps.cfg.outputs.date }}-${{ steps.cfg.outputs.mode }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/work/data/odds_ts
+          retention-days: 14
+          if-no-files-found: ignore
