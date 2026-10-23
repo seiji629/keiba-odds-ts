@@ -1,6 +1,10 @@
-"""作業ディレクトリ (収集器が書いている) の CSV/ログを repo の data/odds_ts/ に合流させて commit + push する。
+"""作業ディレクトリ (収集器が書いている) の CSV/ログを、データ用 repo (非公開の keiba-odds-data の checkout) の
+DST_DIR に合流させて commit + push する。
 
-    python3 scripts/sync_odds.py WORK_DIR YYYYMMDD "odds_ts 20261024 morning"
+    python3 scripts/sync_odds.py WORK_DIR DST_DIR YYYYMMDD "odds_ts 20261024 morning"
+
+- DST_DIR は git checkout の中のディレクトリ (例: datarepo/data/odds_ts)。commit/push はその checkout の origin
+  (actions/checkout が deploy key の SSH で設定したもの) に対して行う。
 
 - 収集器のファイルには一切触らない (読むだけ)。書きかけの最終行 (改行で終わっていない部分) は今回は取らない。
 - 毎回 origin/main に reset --hard してから「origin の行 + まだ無い作業側の行」を書き、commit して push する。
@@ -15,8 +19,8 @@ import sys
 import time
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parent.parent
-DST = REPO / "data" / "odds_ts"
+REPO: Path
+DST: Path
 
 
 def git(*args, check=True):
@@ -46,7 +50,17 @@ def merge_into(src: Path, dst: Path) -> None:
 
 
 def main():
-    work, ymd, msg = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+    global REPO, DST
+    if len(sys.argv) != 5:
+        print(__doc__, file=sys.stderr)
+        return 2
+    work, DST, ymd, msg = Path(sys.argv[1]), Path(sys.argv[2]).resolve(), sys.argv[3], sys.argv[4]
+    base = DST
+    while not base.exists():
+        base = base.parent
+    top = subprocess.run(["git", "-C", str(base), "rev-parse", "--show-toplevel"],
+                         check=True, text=True, capture_output=True).stdout.strip()
+    REPO = Path(top)
     if not (work / f"{ymd}_races.csv").exists():
         print(f"sync: {ymd}_races.csv が無い (レースの無い日)。commit しません")
         return 0
@@ -68,7 +82,7 @@ def main():
             return 0
         print(f"sync: push 失敗 ({attempt} 回目): {r.stderr.strip()[:300]}")
         time.sleep(5 * attempt)
-    print("sync: 5 回失敗。artifact を見てください", file=sys.stderr)
+    print("sync: 5 回失敗", file=sys.stderr)
     return 1
 
 

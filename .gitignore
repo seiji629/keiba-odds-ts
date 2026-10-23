@@ -4,6 +4,6 @@ __pycache__/
 .DS_Store
 .netrc
 *.netrc
-data/odds_ts/dryrun/
-data/odds_ts/*_summary.csv
-data/odds_ts/*_late_change.csv
+# データはこの公開 repo に入れない (非公開の seiji629/keiba-odds-data に置く)
+data/
+datarepo/

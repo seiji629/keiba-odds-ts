@@ -10,9 +10,9 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "morning / afternoon / once"
+        description: "morning / afternoon / once / synctest (データ repo への書き込み確認、netkeiba には触らない)"
         type: choice
-        options: [morning, afternoon, once]
+        options: [morning, afternoon, once, synctest]
         default: once
       date:
         description: "YYYYMMDD (空なら今日、JST)"
@@ -29,8 +29,10 @@ concurrency:
   group: ${{ (github.event_name == 'workflow_dispatch' && inputs.mode == 'once') && format('once-{0}', github.run_id) || 'collect' }}
   cancel-in-progress: false
 
+# この公開 repo には書かない。データは非公開 repo seiji629/keiba-odds-data に deploy key (secret DATA_DEPLOY_KEY) で push する
+# (netkeiba 利用規約: 不特定多数が閲覧できる場所に置かない)。artifact も公開 repo では誰でも落とせるので作らない。
 permissions:
-  contents: write
+  contents: read
 
 env:
   TZ: Asia/Tokyo
@@ -41,6 +43,16 @@ jobs:
     timeout-minutes: 355
     steps:
       - uses: actions/checkout@v4
+
+      - name: checkout data repo (非公開)
+        if: github.event_name == 'schedule' || inputs.mode != 'once'
+        uses: actions/checkout@v4
+        with:
+          repository: seiji629/keiba-odds-data
+          path: datarepo
+          ssh-key: ${{ secrets.DATA_DEPLOY_KEY }}
+          persist-credentials: true
+          fetch-depth: 1
 
       - uses: actions/setup-python@v5
         with:
@@ -71,12 +83,15 @@ jobs:
             morning)   UNTIL=14:20 ;;
             afternoon) UNTIL=17:45 ;;
             once)      UNTIL= ; [[ "$IN_RACE" =~ ^[0-9]{12}$ ]] || { echo "bad race_id: $IN_RACE"; exit 1; } ;;
+            synctest)  UNTIL= ;;
             *) echo "bad mode: $MODE"; exit 1 ;;
           esac
           echo "mode=$MODE date=$D until=$UNTIL now=$(date '+%F %T %Z')"
           { echo "mode=$MODE"; echo "date=$D"; echo "until=$UNTIL"; echo "race_id=$IN_RACE"; } >> "$GITHUB_OUTPUT"
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if [ -d datarepo/.git ]; then
+            git -C datarepo config user.name seiji629
+            git -C datarepo config user.email seiji629@users.noreply.github.com
+          fi
 
       - name: once (1 レースの現在値を表示するだけ、書き込みなし)
         if: steps.cfg.outputs.mode == 'once'
@@ -89,7 +104,7 @@ jobs:
           echo "wall: $(python3 -c "print(round($(date +%s.%N) - $start, 2))") s"
 
       - name: collect (30 分ごとに途中 push)
-        if: steps.cfg.outputs.mode != 'once'
+        if: steps.cfg.outputs.mode == 'morning' || steps.cfg.outputs.mode == 'afternoon'
         timeout-minutes: 350
         env:
           MODE: ${{ steps.cfg.outputs.mode }}
@@ -100,31 +115,37 @@ jobs:
           mkdir -p "$W/data/odds_ts"
           cp odds_collector.py "$W/"
           # 同じ日の既存ファイルを引き継ぐ (収集器は追記し、last_official で続きから取る)
-          cp data/odds_ts/${D}_*.csv data/odds_ts/collector.log "$W/data/odds_ts/" 2>/dev/null || true
+          cp datarepo/data/odds_ts/${D}_*.csv datarepo/data/odds_ts/collector.log "$W/data/odds_ts/" 2>/dev/null || true
           python3 "$W/odds_collector.py" --date "$D" --place --until "$UNTIL" &
           PID=$!
           last=$SECONDS
           while kill -0 "$PID" 2>/dev/null; do
             sleep 30
             if (( SECONDS - last >= 1800 )); then
-              python3 scripts/sync_odds.py "$W/data/odds_ts" "$D" "odds_ts $D $MODE (途中)" || true
+              python3 scripts/sync_odds.py "$W/data/odds_ts" datarepo/data/odds_ts "$D" "odds_ts $D $MODE (途中)" || true
               last=$SECONDS
             fi
           done
           wait "$PID"
 
       - name: commit + push (失敗・中断でも)
-        if: always() && steps.cfg.outputs.mode != 'once' && steps.cfg.outputs.mode != ''
+        if: always() && (steps.cfg.outputs.mode == 'morning' || steps.cfg.outputs.mode == 'afternoon')
         env:
           MODE: ${{ steps.cfg.outputs.mode }}
           D: ${{ steps.cfg.outputs.date }}
-        run: python3 scripts/sync_odds.py "$RUNNER_TEMP/work/data/odds_ts" "$D" "odds_ts $D $MODE"
+        run: python3 scripts/sync_odds.py "$RUNNER_TEMP/work/data/odds_ts" datarepo/data/odds_ts "$D" "odds_ts $D $MODE"
 
-      - name: artifact (保険、14 日)
-        if: always() && steps.cfg.outputs.mode != 'once' && steps.cfg.outputs.mode != ''
-        uses: actions/upload-artifact@v4
-        with:
-          name: odds_ts-${{ steps.cfg.outputs.date }}-${{ steps.cfg.outputs.mode }}-${{ github.run_id }}
-          path: ${{ runner.temp }}/work/data/odds_ts
-          retention-days: 14
-          if-no-files-found: ignore
+      - name: synctest (印のファイルを sync_odds.py で push し、確認後に消す。netkeiba へのリクエストなし)
+        if: steps.cfg.outputs.mode == 'synctest'
+        run: |
+          W="$RUNNER_TEMP/synctest"
+          mkdir -p "$W"
+          printf 'synctest,run_id,at\nsynctest,%s,%s\n' "$GITHUB_RUN_ID" "$(date '+%F %T %Z')" > "$W/00000000_races.csv"
+          python3 scripts/sync_odds.py "$W" datarepo/synctest 00000000 "synctest $GITHUB_RUN_ID"
+          git -C datarepo log -1 --format='pushed: %H %s'
+          git -C datarepo ls-remote origin refs/heads/main
+          git -C datarepo rm -q -r synctest
+          git -C datarepo commit -q -m "synctest $GITHUB_RUN_ID: 印を消す"
+          git -C datarepo push -q origin HEAD:main
+          git -C datarepo log -2 --format='%H %s'
+          git -C datarepo ls-remote origin refs/heads/main

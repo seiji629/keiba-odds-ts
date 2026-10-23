@@ -1,7 +1,22 @@
 # keiba-odds-ts
 
 JRA レース当日の単勝・複勝オッズを netkeiba のオッズ API から時系列で記録する (学習・研究用)。
-収集は GitHub Actions のホストランナーで動かし、結果の CSV を `data/odds_ts/` に commit する。
+収集は GitHub Actions のホストランナーで動かし、結果の CSV は**非公開リポジトリ `seiji629/keiba-odds-data`** の
+`data/odds_ts/` に commit する。この公開リポジトリにはコードだけを置き、データは置かない。
+
+## データの置き場所と理由
+
+- netkeiba 利用規約 (第 14 条) により、取得したデータを不特定多数が閲覧できる場所に置けない。そのためコード (この repo) は公開、
+  データは非公開 repo に分けている。**`keiba-odds-data` を公開にしない・この repo に CSV を commit しない** (`.gitignore` で `data/` を除外)。
+- 書き込みの認証は deploy key: 非公開 repo に書き込み可の deploy key ("keiba-odds-ts actions") を登録し、その秘密鍵を
+  この repo の Actions secret `DATA_DEPLOY_KEY` に入れてある。ワークフローは `actions/checkout` の `ssh-key` で非公開 repo を
+  `./datarepo` に checkout し、そこへ SSH で push する。この repo 自身への権限は `contents: read` だけ。
+  鍵を作り直すときは deploy key と secret を両方入れ替える。fork からの pull request の実行には secret は渡らない。
+- workflow artifact は作らない (公開 repo の artifact はログインした GitHub ユーザーなら誰でも落とせるため)。
+  その分、ジョブが落ちたときに最後の push 以後が失われ得る。
+- 読むとき: `git clone git@github.com:seiji629/keiba-odds-data.git` (または `gh repo clone seiji629/keiba-odds-data`) して
+  `git pull` で更新する。手元で `odds_ts_summary.py` を使うなら、その `data/odds_ts/` をこの repo の `data/odds_ts/` に
+  コピー (またはシンボリックリンク) する。
 
 ## 取り方 (`odds_collector.py`)
 
@@ -20,14 +35,16 @@ JRA レース当日の単勝・複勝オッズを netkeiba のオッズ API か�
 
 - 毎日動く (レースの無い日は約 1 分で終わり、commit もしない)。`env: TZ: Asia/Tokyo` なので「今日」は JST。
 - 収集ジョブは 1 つの concurrency group (`collect`) に並ぶので、同時に 2 つは動かない。午後のジョブは午前のジョブが 14:20 に終わって
-  push し終えてから始まり、その時点の data を checkout して同じ日のファイルに追記する (続きから取る)。予備 cron は本体の後に起動し、
+  push し終えてから始まり、その時点のデータ repo を checkout して同じ日のファイルに追記する (続きから取る)。予備 cron は本体の後に起動し、
   `--until` を過ぎていればすぐ終わる。GitHub の cron は数分〜数十分遅れることがあり、混雑時は飛ばされることもある。
 - 収集中は 30 分ごとに `scripts/sync_odds.py` で commit + push し、終了時 (失敗・中断でも `if: always()`) にもう一度 push する。
   push は毎回 origin/main を取り直して「origin の行 + 新しい行」を書くので衝突しない (最大 5 回やり直し)。
-  `data/odds_ts` は workflow artifact (14 日保存) にも上げる。
-- **ジョブが落ちた・キャンセルされた場合、最後の push 以後 (最大 30 分) は失われ得る。** artifact も最後のステップに到達したときだけ作られる。
-- 手動実行: Actions → collect → Run workflow (`mode`: morning / afternoon / once、`date`、`race_id`)。
-  `once` は 1 レースの現在値を表示するだけで何も書かない (疎通確認用)。
+  push 先は `datarepo` (非公開 repo の checkout) の origin。
+- **ジョブが落ちた・キャンセルされた場合、最後の push 以後 (最大 30 分) は失われ得る** (artifact は作らない)。
+- 手動実行: Actions → collect → Run workflow (`mode`: morning / afternoon / once / synctest、`date`、`race_id`)。
+  `once` は 1 レースの現在値を表示するだけで何も書かない (疎通確認用、データ repo も checkout しない)。
+  `synctest` は netkeiba に触らず、印のファイル `synctest/00000000_races.csv` を `sync_odds.py` で非公開 repo に push し、
+  すぐ消す commit を push する (deploy key と push 経路の確認用)。
 - 止めるとき: Actions → collect → `…` → Disable workflow。
 - 公開リポジトリで 60 日間活動が無いと GitHub が schedule を自動で止める。
 
@@ -41,9 +58,10 @@ python3 odds_collector.py --place --until 17:45        # 今日の本番
 python3 odds_ts_summary.py 20261024                    # レースごとの要約
 ```
 
-Actions と手元で同じ日に同時に動かさないこと (並列になる)。
+Actions と手元で同じ日に収集器を動かさないこと (並列になる)。手元で書いた `data/odds_ts/` は git に入らない
+(`.gitignore`)。本番データは非公開 repo を clone して読む。
 
-## CSV (`data/odds_ts/`、追記のみ)
+## CSV (非公開 repo の `data/odds_ts/`、追記のみ)
 
 - `YYYYMMDD_races.csv`: race_id, venue (場コード 01 札幌 … 10 小倉), race_no, post_time, source
 - `YYYYMMDD_win.csv`: fetched_at (取得時刻), official_datetime (JRA のオッズ時刻), race_id, umaban, odds, popularity。
