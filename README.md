@@ -31,12 +31,20 @@ JRA レース当日の単勝・複勝オッズを netkeiba のオッズ API か�
 | ジョブ | cron (UTC) | JST | コマンド |
 |---|---|---|---|
 | morning | `30 23 * * *` / 予備 `45 23 * * *` | 08:30 / 08:45 | `odds_collector.py --place --until 14:20` |
-| afternoon | `10 5 * * *` / 予備 `25 5 * * *` | 14:10 / 14:25 | `odds_collector.py --place --until 17:45` |
+| afternoon | `40 4 * * *` / 予備 `55 4 * * *` | 13:40 / 13:55 | `odds_collector.py --place --until 17:45` |
 
 - 毎日動く (レースの無い日は約 1 分で終わり、commit もしない)。`env: TZ: Asia/Tokyo` なので「今日」は JST。
-- 収集ジョブは 1 つの concurrency group (`collect`) に並ぶので、同時に 2 つは動かない。午後のジョブは午前のジョブが 14:20 に終わって
-  push し終えてから始まり、その時点のデータ repo を checkout して同じ日のファイルに追記する (続きから取る)。予備 cron は本体の後に起動し、
-  `--until` を過ぎていればすぐ終わる。GitHub の cron は数分〜数十分遅れることがあり、混雑時は飛ばされることもある。
+- 収集ジョブは 1 つの concurrency group (`collect`, `cancel-in-progress: false`) に並ぶので、同時に 2 つは動かない。
+  GitHub は 1 group に「実行中 1 本 + 待ち (pending) 1 本」までしか持たず、新しい pending は古い pending をキャンセルする。
+- **午前→午後の引き継ぎ**: GitHub の cron は数分〜数十分遅れることがあり (2026-10-24 は 14:10 の cron が 14:34 に起動し、
+  14:20〜14:34 に取得の空白ができた)、混雑時は飛ばされることもある。そこで午後の cron は午前の `--until 14:20` より前の
+  13:40 / 13:55 にしてある。午後の実行は午前の実行中に pending になり (残っていた午前の予備 pending はこれでキャンセルされる。
+  13:55 の予備が来れば 13:40 の pending と入れ替わるだけで、どちらも afternoon)、午前が 14:20 に終わって push し終えた直後に始まる。
+  その時点のデータ repo を checkout して同じ日のファイルに追記する (続きから取る)。午前がすでに終わっていれば午後はすぐ始まり 17:45 まで動く。
+  `--until` は「今日の HH:MM」なので、14:2x に始まった午後の実行は止まらない。`--until` を過ぎてから始まった実行
+  (午後の後ろに並んだ予備など) は一覧を 1 回取ってすぐ終わる。
+- mode は cron 文字列で決める (`30 23`/`45 23` → morning、`40 4`/`55 4` → afternoon)。知らない文字列なら JST の起動時刻が
+  13:30 以後で afternoon、それより前で morning。
 - 収集中は 30 分ごとに `scripts/sync_odds.py` で commit + push し、終了時 (失敗・中断でも `if: always()`) にもう一度 push する。
   push は毎回 origin/main を取り直して「origin の行 + 新しい行」を書くので衝突しない (最大 5 回やり直し)。
   push 先は `datarepo` (非公開 repo の checkout) の origin。

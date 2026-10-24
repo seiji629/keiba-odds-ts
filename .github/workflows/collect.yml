@@ -5,8 +5,10 @@ on:
     # UTC。JST = UTC+9。毎日動かす (レースの無い日は一覧が空で 1 リクエストで終わる)
     - cron: "30 23 * * *"   # morning   JST 08:30
     - cron: "45 23 * * *"   # morning   JST 08:45 (予備)
-    - cron: "10 5 * * *"    # afternoon JST 14:10
-    - cron: "25 5 * * *"    # afternoon JST 14:25 (予備)
+    # afternoon は午前の --until 14:20 より前に起動させ、concurrency group で待たせる
+    # (cron が遅れても、午前が終わった瞬間に午後が始まる = 引き継ぎに隙間ができない)
+    - cron: "40 4 * * *"    # afternoon JST 13:40
+    - cron: "55 4 * * *"    # afternoon JST 13:55 (予備)
   workflow_dispatch:
     inputs:
       mode:
@@ -24,7 +26,10 @@ on:
         default: "202605040611"
 
 # 収集ジョブは午前・午後とも 1 本の列に並べる (同時に 2 つの収集器を動かさない = 並列なし)。
-# 予備 cron は本体が動いている間は待ち、本体が --until で終わった後に起動して、その時刻が --until を過ぎていればすぐ終わる。
+# GitHub の規則: 1 group に running 1 本 + pending 1 本まで。新しい pending は古い pending をキャンセルする。
+# 午後の cron (13:40 / 13:55) は午前 (〜14:20) の実行中に pending になり、残っていた午前の予備 pending を置き換え、
+# 午前が 14:20 に終わるとすぐ始まる (13:55 の予備が来れば 13:40 の pending と入れ替わるだけで、どちらも afternoon)。
+# 午前が早く終わっていれば午後はそのまま始まり 17:45 まで動く。--until を過ぎてから始まった実行は一覧を 1 回取ってすぐ終わる。
 concurrency:
   group: ${{ (github.event_name == 'workflow_dispatch' && inputs.mode == 'once') && format('once-{0}', github.run_id) || 'collect' }}
   cancel-in-progress: false
@@ -72,7 +77,9 @@ jobs:
           if [ "$EVENT" = "schedule" ]; then
             case "$SCHED" in
               "30 23 * * *"|"45 23 * * *") MODE=morning ;;
-              *) MODE=afternoon ;;
+              "40 4 * * *"|"55 4 * * *")   MODE=afternoon ;;
+              *) # 知らない cron 文字列: JST の起動時刻で決める (13:30 以後なら午後)
+                 if [ "$(date +%H%M)" -ge 1330 ]; then MODE=afternoon; else MODE=morning; fi ;;
             esac
           else
             MODE="$IN_MODE"
